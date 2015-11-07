@@ -1,5 +1,10 @@
+#![feature(alloc, heap_api, oom)]
+
+extern crate alloc;
 #[macro_use]
 extern crate nom;
+
+mod buf;
 
 use nom::le_u32;
 
