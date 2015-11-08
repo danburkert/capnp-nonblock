@@ -1,6 +1,11 @@
 use alloc::{self, heap};
 use std::{cmp, io, mem, ops, ptr, slice};
 
+use std::io::Write;
+
+/// Default buffer size. Perhaps this should be tunable.
+const BUF_SIZE: usize = 4096;
+
 /// An append only byte buffer.
 ///
 /// `MutBuf` keeps an internal byte buffer to which it allows bytes to be
@@ -29,9 +34,13 @@ impl io::Write for MutBuf {
 
 impl MutBuf {
 
-    pub fn new(len: usize) -> MutBuf {
+    pub fn new() -> MutBuf {
+        MutBuf::with_capacity(BUF_SIZE)
+    }
+
+    pub fn with_capacity(cap: usize) -> MutBuf {
         MutBuf {
-            raw: RawBuf::new(len),
+            raw: RawBuf::new(cap),
             offset: 0,
         }
     }
@@ -48,6 +57,62 @@ impl MutBuf {
                 ptr: self.raw.buf().offset(offset as isize),
                 len: len,
             }
+        }
+    }
+
+    /// Attempts to fill the buffer with at least `amount` bytes from `read`.
+    /// The remaining capacity of the buffer must exceed `amount`.
+    fn fill<R>(&mut self, read: &mut R, amount: usize) -> io::Result<()> where R: io::Read {
+        let mut buf = unsafe {
+            assert!(self.raw.len() - self.offset >= amount);
+            slice::from_raw_parts_mut(self.raw.buf().offset(self.offset as isize), amount)
+        };
+
+        while !buf.is_empty() {
+            match try!(read.read(&mut buf)) {
+                0 => return Result::Err(io::Error::new(io::ErrorKind::UnexpectedEOF,
+                                                       "failed to fill whole buffer")),
+                n => { let mut tmp = buf; buf = &mut tmp[n..] },
+            }
+        }
+        Ok(())
+    }
+
+    /// Attemps to fill the buffer with at least `amount` bytes after the offset
+    /// `from`.
+    ///
+    /// If the buffer does not have enough capacity it is replaced with a new
+    /// one, and `from` is reset to the corresponding offset in the new buffer.
+    pub fn fill_or_replace<R>(&mut self,
+                              read: &mut R,
+                              from: &mut usize,
+                              amount: usize)
+                              -> io::Result<()>
+    where R: io::Read {
+        assert!(*from < self.offset);
+
+        if self.offset - *from >= amount { return Ok(()) }
+
+        if self.raw.len() - *from < amount {
+            // Replace self with a new buffer with sufficient capacity. Copy
+            // over all bytes between `from` and the current write offset, and
+            // reset `from` to 0.
+            let old_buf = mem::replace(self, MutBuf::with_capacity(cmp::max(BUF_SIZE, amount)));
+            try!(self.write(&old_buf[*from..]));
+            *from = 0;
+        }
+
+        let offset = self.offset;
+        self.fill(read, amount.wrapping_add(*from).wrapping_sub(offset))
+    }
+}
+
+impl ops::Deref for MutBuf {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        unsafe {
+            slice::from_raw_parts(self.raw.buf(), self.offset)
         }
     }
 }
@@ -97,9 +162,10 @@ impl RawBuf {
         unsafe {
             let refcount_len = mem::size_of::<u64>();
             let len = cmp::max(refcount_len, len);
-            // The buffer is aligned to the refcount. This is the primary reason
-            // that the raw allocation APIs are used instead of something like
-            // RawVec.
+            // The buffer is aligned to a u64. This is necessary for storing the
+            // refcount, as well as required by Cap'n Proto. This requirement is
+            // the primary reason that the raw allocation APIs are used instead
+            // of something like RawVec.
             let bytes = heap::allocate(len, refcount_len);
             if bytes == ptr::null_mut() { alloc::oom() }
             *(bytes as *mut u64) = 1;
@@ -166,14 +232,14 @@ mod test {
 
     #[test]
     fn mut_buf_write() {
-        let mut buf = MutBuf::new(16);
+        let mut buf = MutBuf::with_capacity(16);
         assert_eq!(8, buf.write(b"abcdefghijk").unwrap());
         assert_eq!(0, buf.write(b"abcdefghijk").unwrap());
     }
 
     #[test]
     fn buf() {
-        let mut buf = MutBuf::new(16);
+        let mut buf = MutBuf::with_capacity(16);
         buf.write_all(b"abcdefgh").unwrap();
         assert_eq!(b"", &*buf.buf(0, 0));
         assert_eq!(b"a", &*buf.buf(0, 1));
