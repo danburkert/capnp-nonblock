@@ -6,9 +6,9 @@ description = "Cap'n Proto serialization on non-blocking streams"
 
 [dependencies]
 nom = { git = "https://github.com/Geal/nom.git" }
-capnp = { git = "https://github.com/danburkert/capnproto-rust.git" }
+capnp = "0.5"
+byteorder = "0.4"
 
 [dev-dependencies]
-capnp = { git = "http://github.com/danburkert/capnproto-rust.git", features = ["quickcheck"] }
+capnp = { version = "0.5", features = ["quickcheck"] }
 quickcheck = "0.2"
-byteorder = "0.4"

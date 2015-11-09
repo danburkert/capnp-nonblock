@@ -232,7 +232,7 @@ impl Drop for RawBuf {
 #[cfg(test)]
 mod test {
 
-    use std::io::{Cursor, Read, Write};
+    use std::io::{Cursor, Write};
 
     use super::{MutBuf, RawBuf};
 

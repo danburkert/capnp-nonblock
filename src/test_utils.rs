@@ -4,7 +4,6 @@ use std::io::{self, Read, Write};
 use std::cmp;
 
 use capnp::Word;
-use capnp::message::{Reader, ReaderOptions, ReaderSegments};
 
 use byteorder::{ByteOrder, LittleEndian};
 

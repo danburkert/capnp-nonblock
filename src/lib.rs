@@ -7,7 +7,6 @@ extern crate nom;
 
 #[cfg(test)]
 extern crate quickcheck;
-#[cfg(test)]
 extern crate byteorder;
 
 mod buf;
@@ -16,12 +15,14 @@ mod buf;
 mod test_utils;
 
 use std::cmp;
+use std::collections::VecDeque;
 use std::io;
-use std::result;
 use std::mem;
+use std::result;
 
+use byteorder::{ByteOrder, LittleEndian};
 use capnp::Word;
-use capnp::message::{Reader, ReaderOptions, ReaderSegments};
+use capnp::message::{Builder, Reader, ReaderOptions, ReaderSegments};
 use capnp::{Error, Result};
 use nom::le_u32;
 
@@ -37,47 +38,78 @@ impl ReaderSegments for Segments {
     }
 }
 
+pub type OutboundMessage = capnp::message::Builder<capnp::message::HeapAllocator>;
+
 /// A message reader wraps an instance of
 /// [`Read`](https://doc.rust-lang.org/stable/std/io/trait.Read.html) and
-/// provides an iterator over the messages. `MessageReader` performs it's own
+/// provides an iterator over the messages. `MessageStream` performs it's own
 /// internal buffering, so the provided `Read` instance need not be buffered.
 ///
 /// The messages must be in the standard uncompressed Cap'n Proto
 /// [stream format](https://capnproto.org/encoding.html#serialization-over-a-stream).
 ///
-/// `MessageReader` attempts to reduce the number of required allocations by
-/// allocating memory in large chunks, which it loans out to messages via
-/// reference counting. The reference counting is not thread safe, so messages
-/// read by `MessageReader` may not be sent or shared across thread boundaries.
-pub struct MessageReader<R> {
-    read: R,
+/// `MessageStream` attempts to reduce the number of required allocations when
+/// reading messages by allocating memory in large chunks, which it loans out to
+/// messages via reference counting. The reference counting is not thread safe,
+/// so messages read by `MessageStream` may not be sent or shared across thread
+/// boundaries.
+pub struct MessageStream<S> {
+    stream: S,
     options: ReaderOptions,
+
+    /// The current read buffer.
     buf: MutBuf,
+    /// The current read offset.
     buf_offset: usize,
-    /// Holds the segment sizes of the remaining segments in the message in
-    /// reverse order.
+    /// The segment sizes of the remaining segments of message currently being
+    /// read, in reverse order.
     remaining_segments: Vec<usize>,
+    /// The segments of the message currently being read.
     segments: Vec<Buf>,
+
+    /// Queue of outbound messages which have not yet begun being written to the
+    /// stream.
+    write_queue: VecDeque<OutboundMessage>,
+
+    /// The outbound message currently being written to the stream.
+    current_write: Option<OutboundMessage>,
+
+    /// The serialized segment table of the message currently being written to
+    /// the stream.
+    current_segment_table: Vec<u8>,
+
+    /// The progress of the current write.
+    ///
+    /// The first corresponds to the segment currently being written, offset by
+    /// 1, or 0 if the segment table is being written. The second corresponds to
+    /// the offset within the current segment.
+    current_segment: (usize, usize),
 }
 
-impl <R> MessageReader<R> where R: io::Read {
-
-    pub fn new(read: R, options: ReaderOptions) -> MessageReader<R> {
-        MessageReader {
-            read: read,
+impl <S> MessageStream<S> {
+    pub fn new(stream: S, options: ReaderOptions) -> MessageStream<S> {
+        MessageStream {
+            stream: stream,
             options: options,
             buf: MutBuf::new(),
             buf_offset: 0,
             remaining_segments: Vec::new(),
             segments: Vec::new(),
+            write_queue: VecDeque::new(),
+            current_segment_table: Vec::new(),
+            current_write: None,
+            current_segment: (0, 0),
         }
     }
+}
+
+impl <S> MessageStream<S> where S: io::Read {
 
     /// Reads the segment table, populating the `remaining_segments` field of the
     /// reader on success.
     fn read_segment_table(&mut self) -> Result<()> {
-        let MessageReader {
-            ref mut read,
+        let MessageStream {
+            ref mut stream,
             ref options,
             ref mut buf,
             ref mut buf_offset,
@@ -103,7 +135,7 @@ impl <R> MessageReader<R> where R: io::Read {
                         nom::Needed::Unknown => 8,
                         nom::Needed::Size(size) => cmp::max(8, size),
                     };
-                    try!(buf.fill_or_replace(read, buf_offset, amount));
+                    try!(buf.fill_or_replace(stream, buf_offset, amount));
                 },
             }
         }
@@ -125,13 +157,13 @@ impl <R> MessageReader<R> where R: io::Read {
     }
 
     fn read_segment(&mut self, len: usize) -> Result<Buf> {
-        let MessageReader {
-            ref mut read,
+        let MessageStream {
+            ref mut stream,
             ref mut buf,
             ref mut buf_offset,
             ..
         } = *self;
-        try!(buf.fill_or_replace(read, buf_offset, len));
+        try!(buf.fill_or_replace(stream, buf_offset, len));
         let buf = buf.buf(*buf_offset, len);
         *buf_offset += len;
         Ok(buf)
@@ -155,7 +187,124 @@ impl <R> MessageReader<R> where R: io::Read {
     }
 }
 
-impl <R> Iterator for MessageReader<R> where R: io::Read {
+/// Serializes the segment table for the provided segments.
+fn serialize_segment_table(segment_table: &mut Vec<u8>, segments: &[&[Word]]) {
+    segment_table.clear();
+
+    let mut buf: [u8; 4] = [0; 4];
+
+    <LittleEndian as ByteOrder>::write_u32(&mut buf[..], segments.len() as u32 - 1);
+    segment_table.extend(&buf);
+
+    for segment in segments {
+        <LittleEndian as ByteOrder>::write_u32(&mut buf[..], segment.len() as u32);
+        segment_table.extend(&buf);
+    }
+
+    if segments.len() % 2 == 0 {
+        segment_table.extend(&[0, 0, 0, 0]);
+    }
+}
+
+/// Like Write::write_all, but increments `offset` after every successful
+/// write.
+fn write_segment<W>(write: &mut W, mut buf: &[u8], offset: &mut usize) -> io::Result<()>
+where W: io::Write {
+    while !buf.is_empty() {
+        match write.write(buf) {
+            Ok(0) => return result::Result::Err(io::Error::new(io::ErrorKind::WriteZero,
+                                                                "failed to write whole message")),
+            Ok(n) => { *offset += n; buf = &buf[n..] },
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn write_message<W>(write: &mut W,
+                    segment_table: &Vec<u8>,
+                    message: &OutboundMessage,
+                    current_segment: &mut (usize, usize))
+                    -> io::Result<()>
+where W: io::Write {
+    let (ref mut segment_index, ref mut segment_offset) = *current_segment;
+
+    if *segment_index == 0 {
+        try!(write_segment(write, &segment_table[*segment_offset..], segment_offset));
+        *segment_offset = 0;
+        *segment_index += 1;
+    }
+
+    for segment in &message.get_segments_for_output()[(*segment_index - 1)..] {
+        try!(write_segment(write,
+                           &Word::words_to_bytes(segment)[*segment_offset..],
+                           segment_offset));
+        *segment_offset = 0;
+        *segment_index += 1;
+    }
+    Ok(())
+}
+
+impl <S> MessageStream<S> where S: io::Write {
+
+    /// Writes queued messages to the stream. This should be called when the
+    /// stream is in non-blocking mode and writable.
+    pub fn write(&mut self) -> io::Result<()> {
+
+        let MessageStream {
+            ref mut stream,
+            ref mut write_queue,
+            ref mut current_write,
+            ref mut current_segment_table,
+            ref mut current_segment,
+            ..
+        } = *self;
+
+        loop {
+            // Get the current message, otherwise pop the next message from the
+            // queue and serialize a new segment table. If the queue is empty, return.
+            let message: &OutboundMessage = if let Some(ref message) = *current_write {
+                message
+            } else {
+                *current_write = write_queue.pop_front();
+                match current_write.as_ref() {
+                    Some(message) => {
+                        serialize_segment_table(current_segment_table,
+                                                &*message.get_segments_for_output());
+                        *current_segment = (0, 0);
+                        message
+                    },
+                    None => return Ok(()),
+                }
+            };
+
+            match write_message(stream, current_segment_table, message, current_segment) {
+                Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Ok(_) => continue,
+                error => return error,
+            }
+        }
+    }
+
+    /// Queue message for write.
+    ///
+    /// This method optimistically begins writing to the stream if there is no
+    /// message currently being written. This is necessary for the blocking
+    /// stream case, and efficient in the non-blocking case as well, since it is
+    /// likely that the stream is writable.
+    pub fn write_message(&mut self, message: OutboundMessage) -> io::Result<()> {
+        self.write_queue.push_back(message);
+
+        if self.current_write.is_none() {
+            self.write()
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl <S> Iterator for MessageStream<S> where S: io::Read {
     type Item = Result<Reader<Segments>>;
 
     fn next(&mut self) -> Option<Result<Reader<Segments>>> {
@@ -201,7 +350,7 @@ pub mod test {
 
     use super::{
         parse_segment_table,
-        MessageReader,
+        MessageStream,
     };
 
     use test_utils::*;
@@ -268,7 +417,7 @@ pub mod test {
             write_message_segments(&mut cursor, &segments);
             cursor.set_position(0);
 
-            let mut message_reader = MessageReader::new(&mut cursor, message::ReaderOptions::new());
+            let mut message_reader = MessageStream::new(&mut cursor, message::ReaderOptions::new());
             let message = message_reader.next().unwrap().unwrap();
             let result_segments = message.into_segments();
 
@@ -279,28 +428,4 @@ pub mod test {
 
         quickcheck(round_trip as fn(Vec<Vec<Word>>) -> TestResult);
     }
-
-    #[test]
-    fn check_round_trip_interrupting() {
-        fn round_trip_interrupting(segments: Vec<Vec<Word>>, frequency: usize) -> TestResult {
-            if segments.len() == 0 || frequency == 0 { return TestResult::discard(); }
-            let mut cursor = Cursor::new(Vec::new());
-
-            write_message_segments(&mut cursor, &segments);
-            cursor.set_position(0);
-            let mut read = InterruptingRead::new(cursor, frequency);
-
-            let mut message_reader = MessageReader::new(&mut read, message::ReaderOptions::new());
-            let message = message_reader.next().unwrap().unwrap();
-            let result_segments = message.into_segments();
-
-            TestResult::from_bool(segments.iter().enumerate().all(|(i, segment)| {
-                &segment[..] == result_segments.get_segment(i as u32).unwrap()
-            }))
-        }
-
-        //quickcheck(round_trip_interrupting as fn(Vec<Vec<Word>>, usize) -> TestResult);
-        round_trip_interrupting(vec![vec![]], 1);
-    }
-
 }
