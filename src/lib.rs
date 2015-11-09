@@ -5,7 +5,15 @@ extern crate capnp;
 #[macro_use]
 extern crate nom;
 
+#[cfg(test)]
+extern crate quickcheck;
+#[cfg(test)]
+extern crate byteorder;
+
 mod buf;
+
+#[cfg(test)]
+mod test_utils;
 
 use std::cmp;
 use std::io;
@@ -92,13 +100,15 @@ impl <R> MessageReader<R> where R: io::Read {
                 nom::IResult::Error(..) => unreachable!(),
                 nom::IResult::Incomplete(needed) => {
                     let amount = match needed {
-                        nom::Needed::Unknown => 64,
-                        nom::Needed::Size(size) => cmp::max(64, size),
+                        nom::Needed::Unknown => 8,
+                        nom::Needed::Size(size) => cmp::max(8, size),
                     };
                     try!(buf.fill_or_replace(read, buf_offset, amount));
                 },
             }
         }
+
+        *buf_offset += (1 + remaining_segments.len() / 2) * 8;
 
         let total_len = remaining_segments.iter()
                                           .fold(Some(0u64), |acc, &len| {
@@ -119,11 +129,12 @@ impl <R> MessageReader<R> where R: io::Read {
             ref mut read,
             ref mut buf,
             ref mut buf_offset,
-            ref mut remaining_segments,
             ..
         } = *self;
-        try!(buf.fill_or_replace(read, buf_offset, remaining_segments[0]));
-        Ok(buf.buf(*buf_offset, len))
+        try!(buf.fill_or_replace(read, buf_offset, len));
+        let buf = buf.buf(*buf_offset, len);
+        *buf_offset += len;
+        Ok(buf)
     }
 
     fn read_message(&mut self) -> Result<Reader<Segments>> {
@@ -190,7 +201,16 @@ pub mod test {
 
     use super::{
         parse_segment_table,
+        MessageReader,
     };
+
+    use test_utils::*;
+
+    use std::io::Cursor;
+
+    use capnp::{Word, message};
+    use capnp::message::ReaderSegments;
+    use quickcheck::{quickcheck, TestResult};
 
     #[test]
     fn test_parse_segment_table() {
@@ -202,7 +222,7 @@ pub mod test {
 
         compare(&[0 * 8],
                 &[0,0,0,0,   // 1 segments
-                  0,0,0,0]); // 0 length
+                  0,0,0,0]); // 0 words
 
         compare(&[1 * 8],
                 &[0,0,0,0,   // 1 segments
@@ -238,4 +258,49 @@ pub mod test {
         assert!(parse_segment_table(&[1,0,0,0, 0,0,0,0, 0,0,0], &mut v).is_incomplete());
         assert!(parse_segment_table(&[255,255,255,255], &mut v).is_err());
     }
+
+    #[test]
+    fn check_round_trip() {
+        fn round_trip(segments: Vec<Vec<Word>>) -> TestResult {
+            if segments.len() == 0 { return TestResult::discard(); }
+            let mut cursor = Cursor::new(Vec::new());
+
+            write_message_segments(&mut cursor, &segments);
+            cursor.set_position(0);
+
+            let mut message_reader = MessageReader::new(&mut cursor, message::ReaderOptions::new());
+            let message = message_reader.next().unwrap().unwrap();
+            let result_segments = message.into_segments();
+
+            TestResult::from_bool(segments.iter().enumerate().all(|(i, segment)| {
+                &segment[..] == result_segments.get_segment(i as u32).unwrap()
+            }))
+        }
+
+        quickcheck(round_trip as fn(Vec<Vec<Word>>) -> TestResult);
+    }
+
+    #[test]
+    fn check_round_trip_interrupting() {
+        fn round_trip_interrupting(segments: Vec<Vec<Word>>, frequency: usize) -> TestResult {
+            if segments.len() == 0 || frequency == 0 { return TestResult::discard(); }
+            let mut cursor = Cursor::new(Vec::new());
+
+            write_message_segments(&mut cursor, &segments);
+            cursor.set_position(0);
+            let mut read = InterruptingRead::new(cursor, frequency);
+
+            let mut message_reader = MessageReader::new(&mut read, message::ReaderOptions::new());
+            let message = message_reader.next().unwrap().unwrap();
+            let result_segments = message.into_segments();
+
+            TestResult::from_bool(segments.iter().enumerate().all(|(i, segment)| {
+                &segment[..] == result_segments.get_segment(i as u32).unwrap()
+            }))
+        }
+
+        //quickcheck(round_trip_interrupting as fn(Vec<Vec<Word>>, usize) -> TestResult);
+        round_trip_interrupting(vec![vec![]], 1);
+    }
+
 }

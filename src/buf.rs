@@ -6,11 +6,14 @@ use std::io::Write;
 /// Default buffer size. Perhaps this should be tunable.
 const BUF_SIZE: usize = 4096;
 
-/// An append only byte buffer.
+/// A reference counted slab allocator.
 ///
 /// `MutBuf` keeps an internal byte buffer to which it allows bytes to be
-/// written. Once a byte in the buffer is written, it may never be overwritten,
-/// or otherwise recycled.
+/// written. The buffer is fixed size, and append only. The bytes may be shared
+/// as owned `Buf` instances.
+///
+/// The reference counting mechanism of `MutBuf` is not threadsafe, so instances
+/// may not be shared or sent across thread boundaries.
 pub struct MutBuf {
     raw: RawBuf,
     offset: usize,
@@ -47,11 +50,7 @@ impl MutBuf {
 
     pub fn buf(&self, offset: usize, len: usize) -> Buf {
         unsafe {
-            if offset + len > self.offset {
-                panic!("buf out of bounds; requested offset: {}, \
-                        requested length: {}, total length: {}",
-                       offset, len, self.offset);
-            }
+            assert!(offset + len <= self.offset);
             Buf {
                 raw: self.raw.clone(),
                 ptr: self.raw.buf().offset(offset as isize),
@@ -63,16 +62,22 @@ impl MutBuf {
     /// Attempts to fill the buffer with at least `amount` bytes from `read`.
     /// The remaining capacity of the buffer must exceed `amount`.
     fn fill<R>(&mut self, read: &mut R, amount: usize) -> io::Result<()> where R: io::Read {
-        let mut buf = unsafe {
-            assert!(self.raw.len() - self.offset >= amount);
-            slice::from_raw_parts_mut(self.raw.buf().offset(self.offset as isize), amount)
-        };
-
-        while !buf.is_empty() {
-            match try!(read.read(&mut buf)) {
-                0 => return Result::Err(io::Error::new(io::ErrorKind::UnexpectedEOF,
-                                                       "failed to fill whole buffer")),
-                n => { let mut tmp = buf; buf = &mut tmp[n..] },
+        unsafe {
+            let remaining_capacity = self.raw.len() - self.offset;
+            assert!(remaining_capacity >= amount);
+            let mut buf = slice::from_raw_parts_mut(self.raw.buf().offset(self.offset as isize),
+                                                    remaining_capacity);
+            let target_offset = self.offset + amount;
+            while self.offset < target_offset {
+                match try!(read.read(&mut buf)) {
+                    0 => return Result::Err(io::Error::new(io::ErrorKind::UnexpectedEOF,
+                                                           "failed to fill whole buffer")),
+                    n => {
+                        self.offset += n;
+                        let mut tmp = buf;
+                        buf = &mut tmp[n..];
+                    },
+                }
             }
         }
         Ok(())
@@ -89,21 +94,24 @@ impl MutBuf {
                               amount: usize)
                               -> io::Result<()>
     where R: io::Read {
-        assert!(*from < self.offset);
+        assert!(*from <= self.offset);
+        let buffered_amount = self.offset - *from;
+        if buffered_amount >= amount {
+            return Ok(());
+        }
+        let remaining_amount = amount - buffered_amount;
 
-        if self.offset - *from >= amount { return Ok(()) }
+        if remaining_amount > self.raw.len() - self.offset {
 
-        if self.raw.len() - *from < amount {
             // Replace self with a new buffer with sufficient capacity. Copy
             // over all bytes between `from` and the current write offset, and
             // reset `from` to 0.
-            let old_buf = mem::replace(self, MutBuf::with_capacity(cmp::max(BUF_SIZE, amount)));
+            let old_buf = mem::replace(self, MutBuf::with_capacity(cmp::max(BUF_SIZE, amount + 8)));
             try!(self.write(&old_buf[*from..]));
             *from = 0;
         }
 
-        let offset = self.offset;
-        self.fill(read, amount.wrapping_add(*from).wrapping_sub(offset))
+        self.fill(read, remaining_amount)
     }
 }
 
@@ -117,6 +125,13 @@ impl ops::Deref for MutBuf {
     }
 }
 
+/// A view into a `MutBuf`.
+///
+/// A `Buf` increments the reference count of the `MutBuf`, so that a `Buf` can
+/// outlive the `MutBuf` from which it was created.
+///
+/// The reference counting mechanism of `MutBuf` is not threadsafe, so `Buf`
+/// instances may not be shared or sent across thread boundaries.
 pub struct Buf {
     raw: RawBuf,
     ptr: *const u8,
@@ -148,8 +163,11 @@ impl Clone for Buf {
 /// The reference count is the first 8 bytes of the buffer.
 /// The buffer is not initialized.
 ///
-/// The user must coordinate among clones to ensure that data races do not
-/// occur.
+/// It is left to the user to ensure that data races do not occur and
+/// unitialized data is not read.
+///
+/// `RawBuf` is not threadsafe, and may not be sent or shared across thread
+/// boundaries.
 struct RawBuf {
     bytes: *mut u8,
     len: usize,
@@ -214,8 +232,11 @@ impl Drop for RawBuf {
 #[cfg(test)]
 mod test {
 
-    use std::io::Write;
+    use std::io::{Cursor, Read, Write};
+
     use super::{MutBuf, RawBuf};
+
+    use quickcheck::{quickcheck, TestResult};
 
     #[test]
     fn test_create_raw_buf() {
@@ -250,5 +271,90 @@ mod test {
         assert_eq!(b"abcdef", &*buf.buf(0, 6));
         assert_eq!(b"abcdefg", &*buf.buf(0, 7));
         assert_eq!(b"abcdefgh", &*buf.buf(0, 8));
+    }
+
+    #[test]
+    fn fill_or_replace() {
+        let mut buf = MutBuf::with_capacity(14);
+        buf.write_all(b"abcdef").unwrap();
+        let mut offset = 3;
+        buf.fill_or_replace(&mut Cursor::new("ghi"), &mut offset, 6).unwrap();
+        assert_eq!(b"defghi", &*buf.buf(offset, 6));
+    }
+
+    #[test]
+    fn check_buf() {
+        fn buf(segments: Vec<Vec<u8>>) -> TestResult {
+            let total_len: usize = segments.iter().fold(0, |acc, segment| acc + segment.len());
+            let mut buf = MutBuf::with_capacity(total_len + 8);
+
+            for segment in &segments {
+                buf.write_all(&*segment).unwrap();
+            }
+
+            let mut offset = 0;
+            for segment in &segments {
+                if &segment[..] != &*buf.buf(offset, segment.len()) {
+                    return TestResult::failed();
+                }
+                assert_eq!(&segment[..], &*buf.buf(offset, segment.len()));
+                offset += segment.len();
+            }
+
+            TestResult::passed()
+        }
+
+        quickcheck(buf as fn(Vec<Vec<u8>>) -> TestResult);
+    }
+
+    #[test]
+    fn check_fill() {
+        fn fill(segments: Vec<Vec<u8>>) -> TestResult {
+            let total_len: usize = segments.iter().fold(0, |acc, segment| acc + segment.len());
+            let mut buf = MutBuf::with_capacity(total_len + 8);
+
+            for segment in &segments {
+                buf.fill(&mut Cursor::new(segment), segment.len()).unwrap();
+            }
+
+            let mut offset = 0;
+            for segment in &segments {
+                if &segment[..] != &*buf.buf(offset, segment.len()) {
+                    return TestResult::failed();
+                }
+                assert_eq!(&segment[..], &*buf.buf(offset, segment.len()));
+                offset += segment.len();
+            }
+
+            TestResult::passed()
+        }
+
+        quickcheck(fill as fn(Vec<Vec<u8>>) -> TestResult);
+    }
+
+    #[test]
+    fn check_fill_or_replace() {
+        fn fill(a: Vec<u8>, b: Vec<u8>, c: Vec<u8>) -> TestResult {
+            let mut buf = MutBuf::with_capacity(8 + a.len() + b.len());
+
+            buf.write_all(&a).unwrap();
+            buf.write_all(&b).unwrap();
+
+            let mut offset = a.len();
+
+            buf.fill_or_replace(&mut Cursor::new(&c), &mut offset, b.len() + c.len()).unwrap();
+
+            if &b[..] != &*buf.buf(offset, b.len()) {
+                return TestResult::failed();
+            }
+
+            if &c[..] != &*buf.buf(offset + b.len(), c.len()) {
+                return TestResult::failed();
+            }
+
+            TestResult::passed()
+        }
+
+        quickcheck(fill as fn(Vec<u8>, Vec<u8>, Vec<u8>) -> TestResult);
     }
 }

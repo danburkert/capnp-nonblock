@@ -1,8 +1,14 @@
 [package]
-name = "capnp-mio"
+name = "capnp-nonblock"
 version = "0.1.0"
 authors = ["Dan Burkert <dan@danburkert.com>"]
+description = "Cap'n Proto serialization on non-blocking streams"
 
 [dependencies]
 nom = { git = "https://github.com/Geal/nom.git" }
-capnp = "0.5"
+capnp = { git = "https://github.com/danburkert/capnproto-rust.git" }
+
+[dev-dependencies]
+capnp = { git = "http://github.com/danburkert/capnproto-rust.git", features = ["quickcheck"] }
+quickcheck = "0.2"
+byteorder = "0.4"
