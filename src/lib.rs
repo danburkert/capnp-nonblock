@@ -223,8 +223,8 @@ where W: io::Write {
 }
 
 fn write_message<W>(write: &mut W,
-                    segment_table: &Vec<u8>,
-                    message: &OutboundMessage,
+                    segment_table: &[u8],
+                    segments: &[&[Word]],
                     current_segment: &mut (usize, usize))
                     -> io::Result<()>
 where W: io::Write {
@@ -236,7 +236,7 @@ where W: io::Write {
         *segment_index += 1;
     }
 
-    for segment in &message.get_segments_for_output()[(*segment_index - 1)..] {
+    for segment in &segments[(*segment_index - 1)..] {
         try!(write_segment(write,
                            &Word::words_to_bytes(segment)[*segment_offset..],
                            segment_offset));
@@ -279,7 +279,9 @@ impl <S> MessageStream<S> where S: io::Write {
                 }
             };
 
-            match write_message(stream, current_segment_table, message, current_segment) {
+            let segments = &*message.get_segments_for_output();
+
+            match write_message(stream, current_segment_table, segments, current_segment) {
                 Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 Ok(_) => continue,
                 error => return error,
@@ -349,8 +351,10 @@ fn parse_segment_table<'a>(input: &'a [u8], lengths: &mut Vec<usize>) -> nom::IR
 pub mod test {
 
     use super::{
-        parse_segment_table,
         MessageStream,
+        parse_segment_table,
+        serialize_segment_table,
+        write_message,
     };
 
     use test_utils::*;
@@ -409,8 +413,8 @@ pub mod test {
     }
 
     #[test]
-    fn check_round_trip() {
-        fn round_trip(segments: Vec<Vec<Word>>) -> TestResult {
+    fn check_read_segments() {
+        fn read_segments(segments: Vec<Vec<Word>>) -> TestResult {
             if segments.len() == 0 { return TestResult::discard(); }
             let mut cursor = Cursor::new(Vec::new());
 
@@ -426,6 +430,36 @@ pub mod test {
             }))
         }
 
-        quickcheck(round_trip as fn(Vec<Vec<Word>>) -> TestResult);
+        quickcheck(read_segments as fn(Vec<Vec<Word>>) -> TestResult);
+    }
+
+    #[test]
+    fn check_write_segments() {
+        fn write_segments(segments: Vec<Vec<Word>>) -> TestResult {
+            if segments.len() == 0 { return TestResult::discard(); }
+            let mut cursor = Cursor::new(Vec::new());
+            let mut expected_cursor = Cursor::new(Vec::new());
+
+            write_message_segments(&mut expected_cursor, &segments);
+            expected_cursor.set_position(0);
+
+            {
+                let borrowed_segments: &[&[Word]] = &segments.iter()
+                                                            .map(|segment| &segment[..])
+                                                            .collect::<Vec<_>>()[..];
+                let mut segment_table = Vec::new();
+                serialize_segment_table(&mut segment_table, borrowed_segments);
+                let mut current_segment = (0, 0);
+
+                write_message(&mut cursor,
+                              &segment_table[..],
+                              borrowed_segments,
+                              &mut current_segment).unwrap();
+            }
+
+            TestResult::from_bool(expected_cursor.into_inner() == cursor.into_inner())
+        }
+
+        quickcheck(write_segments as fn(Vec<Vec<Word>>) -> TestResult);
     }
 }

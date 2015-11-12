@@ -8,6 +8,9 @@ use capnp::Word;
 use byteorder::{ByteOrder, LittleEndian};
 
 /// Writes segments as if they were a Capnproto message.
+///
+/// This is copied from capnproto-rust, and exists that our read/write format
+/// does not differ from the 'canonical' capnp-rust.
 pub fn write_message_segments<W>(write: &mut W, segments: &Vec<Vec<Word>>) where W: Write {
     /// Writes a segment table to `write`.
     ///

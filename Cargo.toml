@@ -5,7 +5,7 @@ authors = ["Dan Burkert <dan@danburkert.com>"]
 description = "Cap'n Proto serialization on non-blocking streams"
 
 [dependencies]
-nom = { git = "https://github.com/Geal/nom.git" }
+nom = "1"
 capnp = "0.5"
 byteorder = "0.4"
 
