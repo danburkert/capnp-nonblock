@@ -63,34 +63,60 @@ pub fn write_message_segments<W>(write: &mut W, segments: &Vec<Vec<Word>>) where
     write_segments(write, borrowed_segments).unwrap();
 }
 
-/// Wraps a `Read` instance and introduces blocking.
-pub struct BlockingRead<R> where R: Read {
-    /// The wrapped reader
-    read: R,
+/// Wraps a stream and injects artificial blocking.
+pub struct BlockingStream<S> {
+    /// The wrapped stream
+    stream: S,
 
-    /// Number of bytes to read before blocking
+    /// Number of bytes to process read before blocking
     frequency: usize,
 
     /// Number of bytes read since last blocking
-    idx: usize,
+    read_idx: usize,
+
+    /// Number of bytes written since last blocking
+    write_idx: usize,
 }
 
-impl <R> BlockingRead<R> where R: Read {
-    pub fn new(read: R, frequency: usize) -> BlockingRead<R> {
-        BlockingRead { read: read, frequency: frequency, idx: 0 }
+impl <S> BlockingStream<S> {
+
+    pub fn new(stream: S, frequency: usize) -> BlockingStream<S> {
+        BlockingStream { stream: stream, frequency: frequency, read_idx: 0, write_idx: 0 }
+    }
+
+    pub fn inner_mut(&mut self) -> &mut S {
+        &mut self.stream
     }
 }
 
-impl <R> Read for BlockingRead<R> where R: Read {
+impl <R> Read for BlockingStream<R> where R: Read {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.idx == 0 {
-            self.idx = self.frequency;
-            Err(io::Error::new(io::ErrorKind::WouldBlock, "BlockingRead"))
+        if self.read_idx == 0 {
+            self.read_idx = self.frequency;
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "BlockingStream"))
         } else {
-            let len = cmp::min(self.idx, buf.len());
-            let bytes_read = try!(self.read.read(&mut buf[..len]));
-            self.idx -= bytes_read;
+            let len = cmp::min(self.read_idx, buf.len());
+            let bytes_read = try!(self.stream.read(&mut buf[..len]));
+            self.read_idx -= bytes_read;
             Ok(bytes_read)
         }
+    }
+}
+
+impl <S> Write for BlockingStream<S> where S: Write {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.write_idx == 0 {
+            self.write_idx = self.frequency;
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "BlockingStream"))
+        } else {
+            let len = cmp::min(self.write_idx, buf.len());
+            let bytes_read = try!(self.stream.write(&buf[..len]));
+            self.write_idx -= bytes_read;
+            Ok(bytes_read)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
     }
 }

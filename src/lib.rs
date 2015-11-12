@@ -453,7 +453,7 @@ pub mod test {
 
     #[test]
     fn check_round_trip() {
-        fn write_segments(messages: Vec<Vec<Vec<Word>>>) -> TestResult {
+        fn round_trip(messages: Vec<Vec<Vec<Word>>>) -> TestResult {
             let mut cursor = Cursor::new(Vec::new());
 
             for segments in &messages {
@@ -477,6 +477,39 @@ pub mod test {
             TestResult::passed()
         }
 
-        quickcheck(write_segments as fn(Vec<Vec<Vec<Word>>>) -> TestResult);
+        quickcheck(round_trip as fn(Vec<Vec<Vec<Word>>>) -> TestResult);
+    }
+
+    #[test]
+    fn check_round_trip_nonblock() {
+        fn round_trip_nonblock(messages: Vec<Vec<Vec<Word>>>, frequency: usize) -> TestResult {
+            if frequency == 0 { return TestResult::discard(); }
+            let mut stream = test_utils::BlockingStream::new(Cursor::new(Vec::new()), frequency);
+
+            for segments in &messages {
+                if segments.len() == 0 { return TestResult::discard(); }
+                write_message_segments(&mut stream, segments);
+            }
+            stream.inner_mut().set_position(0);
+
+            let mut message_reader = MessageStream::new(&mut stream, message::ReaderOptions::new());
+
+            for segments in &messages {
+                let mut message = None;
+                while let None = message {
+                    message = message_reader.next();
+                }
+                let result_segments = message.unwrap().unwrap().into_segments();
+                for (i, segment) in segments.into_iter().enumerate() {
+                    if &segment[..] != result_segments.get_segment(i as u32).unwrap() {
+                        return TestResult::failed();
+                    }
+                }
+
+            }
+            TestResult::passed()
+        }
+
+        quickcheck(round_trip_nonblock as fn(Vec<Vec<Vec<Word>>>, usize) -> TestResult);
     }
 }
