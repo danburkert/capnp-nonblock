@@ -1,20 +1,17 @@
 #![feature(alloc, heap_api, oom, read_exact)]
 
 extern crate alloc;
+extern crate byteorder;
 extern crate capnp;
-#[macro_use]
-extern crate nom;
 
 #[cfg(test)]
 extern crate quickcheck;
-extern crate byteorder;
 
 mod buf;
 
 #[cfg(test)]
 mod test_utils;
 
-use std::cmp;
 use std::collections::VecDeque;
 use std::io;
 use std::mem;
@@ -24,7 +21,6 @@ use byteorder::{ByteOrder, LittleEndian};
 use capnp::Word;
 use capnp::message::{Builder, Reader, ReaderOptions, ReaderSegments};
 use capnp::{Error, Result};
-use nom::le_u32;
 
 use buf::{MutBuf, Buf};
 
@@ -119,28 +115,14 @@ impl <S> MessageStream<S> where S: io::Read {
 
         loop {
             assert!(remaining_segments.is_empty());
-
             match parse_segment_table(&buf[*buf_offset..], remaining_segments) {
-                nom::IResult::Done(..) => break,
-                nom::IResult::Error(nom::Err::Code(nom::ErrorKind::Custom(0))) => {
-                    return result::Result::Err(Error::new_decode_error("0 segments in message", None));
-                },
-                nom::IResult::Error(nom::Err::Code(nom::ErrorKind::Custom(segment_count))) => {
-                    return result::Result::Err(Error::new_decode_error("too many segments in message",
-                                                                       Some(format!("{}", segment_count))));
-                }
-                nom::IResult::Error(..) => unreachable!(),
-                nom::IResult::Incomplete(needed) => {
-                    let amount = match needed {
-                        nom::Needed::Unknown => 8,
-                        nom::Needed::Size(size) => cmp::max(8, size),
-                    };
-                    try!(buf.fill_or_replace(stream, buf_offset, amount));
-                },
+                Ok(0) => break,
+                Ok(n) => try!(buf.fill_or_replace(stream, buf_offset, n)),
+                Err(error) => return result::Result::Err(error),
             }
         }
 
-        *buf_offset += (1 + remaining_segments.len() / 2) * 8;
+        *buf_offset += (remaining_segments.len() / 2 + 1) * 8;
 
         let total_len = remaining_segments.iter()
                                           .fold(Some(0u64), |acc, &len| {
@@ -320,31 +302,30 @@ impl <S> Iterator for MessageStream<S> where S: io::Read {
 /// Parses a segment table into a sequence of segment lengths, and adds the
 /// lengths to the provided `Vec`.
 ///
-/// Fails if the number of segments in the table is invalid, returning the
-/// number of segments as the error code.
-fn parse_segment_table<'a>(input: &'a [u8], lengths: &mut Vec<usize>) -> nom::IResult<&'a [u8], ()> {
-    let (mut i, segment_count) = try_parse!(input, le_u32);
-    let segment_count = segment_count.wrapping_add(1);
-    if segment_count >= 512 || segment_count == 0 {
-        return nom::IResult::Error(nom::Err::Code(nom::ErrorKind::Custom(segment_count)));
+/// Returns 0 if the parse succeeded, otherwise returns the number of bytes
+/// required to make progress with the parse.
+fn parse_segment_table(buf: &[u8], lengths: &mut Vec<usize>) -> Result<usize> {
+    if buf.len() < 8 { return Ok(8); }
+    let segment_count = <LittleEndian as ByteOrder>::read_u32(&buf[0..4])
+                                                    .wrapping_add(1) as usize;
+
+    if segment_count >= 512 {
+        return result::Result::Err(Error::new_decode_error("too many segments in message",
+                                                           Some(format!("{}", segment_count))));
+    } else if segment_count == 0 {
+        return result::Result::Err(Error::new_decode_error("zero segments in message", None));
     }
 
-    for _ in 0..segment_count {
-        let (i_prime, segment_len) = try_parse!(i, le_u32);
-        // The Cap'n Proto header is in units of 8-byte words; we want bytes.
-        lengths.push(segment_len as usize * 8);
-        i = i_prime;
+    let len = (segment_count / 2 + 1) * 8;
+    if buf.len() < len { return Ok(len); }
+
+    for segment in 0..segment_count {
+        let offset = (segment + 1) * 4;
+        let segment_len = <LittleEndian as ByteOrder>::read_u32(&buf[offset..]) as usize;
+        lengths.push(segment_len * 8);
     }
 
-    if segment_count % 2 == 0 {
-        if i.len() < 4 {
-            nom::IResult::Incomplete(nom::Needed::Size(4))
-        } else {
-            nom::IResult::Done(&i[4..], ())
-        }
-    } else {
-        nom::IResult::Done(i, ())
-    }
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -357,9 +338,9 @@ pub mod test {
         write_message,
     };
 
-    use test_utils::*;
+    use test_utils;
 
-    use std::io::Cursor;
+    use std::io::{self, Cursor, Write};
 
     use capnp::{Word, message};
     use capnp::message::ReaderSegments;
@@ -369,7 +350,7 @@ pub mod test {
     fn test_parse_segment_table() {
         fn compare(expected: &[usize], buf: &[u8]) {
             let mut actual = Vec::new();
-            assert!(parse_segment_table(buf, &mut actual).is_done());
+            assert_eq!(0, parse_segment_table(buf, &mut actual).unwrap());
             assert_eq!(expected, &*actual);
         }
 
@@ -405,11 +386,11 @@ pub mod test {
     #[test]
     fn test_parse_invalid_segment_table() {
         let mut v = Vec::new();
-        assert!(parse_segment_table(&[255,1,0,0], &mut v).is_err());
-        assert!(parse_segment_table(&[0,0,0,0], &mut v).is_incomplete());
-        assert!(parse_segment_table(&[0,0,0,0, 0,0,0], &mut v).is_incomplete());
-        assert!(parse_segment_table(&[1,0,0,0, 0,0,0,0, 0,0,0], &mut v).is_incomplete());
-        assert!(parse_segment_table(&[255,255,255,255], &mut v).is_err());
+        assert!(parse_segment_table(&[255,1,0,0,0,0,0,0], &mut v).is_err());
+        assert_eq!(8, parse_segment_table(&[0,0,0,0], &mut v).unwrap());
+        assert_eq!(8, parse_segment_table(&[0,0,0,0, 0,0,0], &mut v).unwrap());
+        assert_eq!(16, parse_segment_table(&[1,0,0,0, 0,0,0,0, 0,0,0], &mut v).unwrap());
+        assert!(parse_segment_table(&[255,255,255,255,0,0,0,0], &mut v).is_err());
     }
 
     #[test]
@@ -418,7 +399,7 @@ pub mod test {
             if segments.len() == 0 { return TestResult::discard(); }
             let mut cursor = Cursor::new(Vec::new());
 
-            write_message_segments(&mut cursor, &segments);
+            test_utils::write_message_segments(&mut cursor, &segments);
             cursor.set_position(0);
 
             let mut message_reader = MessageStream::new(&mut cursor, message::ReaderOptions::new());
@@ -433,6 +414,25 @@ pub mod test {
         quickcheck(read_segments as fn(Vec<Vec<Word>>) -> TestResult);
     }
 
+    /// Equivalent to `MessageStream::write`, but works on raw segments instead
+    /// of `OutboundMessage` objects, and automatically retries on `WouldBlock`.
+    fn write_message_segments<W>(write: &mut W, segments: &Vec<Vec<Word>>)
+    where W: Write {
+        let segments: &[&[Word]] = &segments.iter()
+                                            .map(|segment| &segment[..])
+                                            .collect::<Vec<_>>()[..];
+        let mut segment_table = Vec::new();
+        serialize_segment_table(&mut segment_table, segments);
+        let mut current_segment = (0, 0);
+
+        loop {
+            match write_message(write, &segment_table, segments, &mut current_segment) {
+                Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                other => { other.unwrap(); return },
+            }
+        }
+    }
+
     #[test]
     fn check_write_segments() {
         fn write_segments(segments: Vec<Vec<Word>>) -> TestResult {
@@ -440,26 +440,43 @@ pub mod test {
             let mut cursor = Cursor::new(Vec::new());
             let mut expected_cursor = Cursor::new(Vec::new());
 
-            write_message_segments(&mut expected_cursor, &segments);
+            test_utils::write_message_segments(&mut expected_cursor, &segments);
             expected_cursor.set_position(0);
 
-            {
-                let borrowed_segments: &[&[Word]] = &segments.iter()
-                                                            .map(|segment| &segment[..])
-                                                            .collect::<Vec<_>>()[..];
-                let mut segment_table = Vec::new();
-                serialize_segment_table(&mut segment_table, borrowed_segments);
-                let mut current_segment = (0, 0);
-
-                write_message(&mut cursor,
-                              &segment_table[..],
-                              borrowed_segments,
-                              &mut current_segment).unwrap();
-            }
+            write_message_segments(&mut cursor, &segments);
 
             TestResult::from_bool(expected_cursor.into_inner() == cursor.into_inner())
         }
 
         quickcheck(write_segments as fn(Vec<Vec<Word>>) -> TestResult);
+    }
+
+    #[test]
+    fn check_round_trip() {
+        fn write_segments(messages: Vec<Vec<Vec<Word>>>) -> TestResult {
+            let mut cursor = Cursor::new(Vec::new());
+
+            for segments in &messages {
+                if segments.len() == 0 { return TestResult::discard(); }
+                write_message_segments(&mut cursor, segments);
+            }
+            cursor.set_position(0);
+
+            let mut message_reader = MessageStream::new(&mut cursor, message::ReaderOptions::new());
+
+            for segments in &messages {
+                let message = message_reader.next().unwrap().unwrap();
+                let result_segments = message.into_segments();
+                for (i, segment) in segments.into_iter().enumerate() {
+                    if &segment[..] != result_segments.get_segment(i as u32).unwrap() {
+                        return TestResult::failed();
+                    }
+                }
+
+            }
+            TestResult::passed()
+        }
+
+        quickcheck(write_segments as fn(Vec<Vec<Vec<Word>>>) -> TestResult);
     }
 }
