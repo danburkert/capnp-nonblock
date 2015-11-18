@@ -13,6 +13,7 @@ mod buf;
 mod test_utils;
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::io;
 use std::mem;
 use std::result;
@@ -50,7 +51,7 @@ pub type OutboundMessage = capnp::message::Builder<capnp::message::HeapAllocator
 /// so messages read by `MessageStream` may not be sent or shared across thread
 /// boundaries.
 pub struct MessageStream<S> {
-    stream: S,
+    inner: S,
     options: ReaderOptions,
 
     /// The current read buffer.
@@ -83,9 +84,9 @@ pub struct MessageStream<S> {
 }
 
 impl <S> MessageStream<S> {
-    pub fn new(stream: S, options: ReaderOptions) -> MessageStream<S> {
+    pub fn new(inner: S, options: ReaderOptions) -> MessageStream<S> {
         MessageStream {
-            stream: stream,
+            inner: inner,
             options: options,
             buf: MutBuf::new(),
             buf_offset: 0,
@@ -97,6 +98,18 @@ impl <S> MessageStream<S> {
             current_segment: (0, 0),
         }
     }
+
+    pub fn has_queued_outbound_messages(&self) -> bool {
+        self.current_write.is_some() || !self.write_queue.is_empty()
+    }
+
+    pub fn inner_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
 }
 
 impl <S> MessageStream<S> where S: io::Read {
@@ -105,7 +118,7 @@ impl <S> MessageStream<S> where S: io::Read {
     /// reader on success.
     fn read_segment_table(&mut self) -> Result<()> {
         let MessageStream {
-            ref mut stream,
+            ref mut inner,
             ref options,
             ref mut buf,
             ref mut buf_offset,
@@ -117,7 +130,7 @@ impl <S> MessageStream<S> where S: io::Read {
             assert!(remaining_segments.is_empty());
             match parse_segment_table(&buf[*buf_offset..], remaining_segments) {
                 Ok(0) => break,
-                Ok(n) => try!(buf.fill_or_replace(stream, buf_offset, n)),
+                Ok(n) => try!(buf.fill_or_replace(inner, buf_offset, n)),
                 Err(error) => return result::Result::Err(error),
             }
         }
@@ -140,18 +153,18 @@ impl <S> MessageStream<S> where S: io::Read {
 
     fn read_segment(&mut self, len: usize) -> Result<Buf> {
         let MessageStream {
-            ref mut stream,
+            ref mut inner,
             ref mut buf,
             ref mut buf_offset,
             ..
         } = *self;
-        try!(buf.fill_or_replace(stream, buf_offset, len));
+        try!(buf.fill_or_replace(inner, buf_offset, len));
         let buf = buf.buf(*buf_offset, len);
         *buf_offset += len;
         Ok(buf)
     }
 
-    fn read_message(&mut self) -> Result<Reader<Segments>> {
+    fn read(&mut self) -> Result<Reader<Segments>> {
         if self.remaining_segments.is_empty() {
             try!(self.read_segment_table());
         }
@@ -166,6 +179,21 @@ impl <S> MessageStream<S> where S: io::Read {
 
         Ok(Reader::new(Segments { segments: mem::replace(&mut self.segments, Vec::new()) },
                        self.options.clone()))
+    }
+
+    pub fn read_message(&mut self) -> Result<Option<Reader<Segments>>> {
+        match self.read() {
+            Err(Error::Io(ref error)) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error),
+            Ok(message) => Ok(Some(message)),
+        }
+    }
+}
+
+impl <S> fmt::Debug for MessageStream<S> where S: fmt::Debug {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "MessageStream {{ inner: {:?}, current_write: {}, outbound_queue_len: {} }}",
+                  self.inner, self.current_write.is_some(), self.write_queue.len())
     }
 }
 
@@ -235,39 +263,41 @@ impl <S> MessageStream<S> where S: io::Write {
     pub fn write(&mut self) -> io::Result<()> {
 
         let MessageStream {
-            ref mut stream,
+            ref mut inner,
             ref mut write_queue,
             ref mut current_write,
             ref mut current_segment_table,
             ref mut current_segment,
             ..
         } = *self;
-
         loop {
-            // Get the current message, otherwise pop the next message from the
-            // queue and serialize a new segment table. If the queue is empty, return.
-            let message: &OutboundMessage = if let Some(ref message) = *current_write {
-                message
-            } else {
-                *current_write = write_queue.pop_front();
-                match current_write.as_ref() {
-                    Some(message) => {
-                        serialize_segment_table(current_segment_table,
-                                                &*message.get_segments_for_output());
-                        *current_segment = (0, 0);
-                        message
-                    },
-                    None => return Ok(()),
+            {
+                // Get the current message, otherwise pop the next message from the
+                // queue and serialize a new segment table. If the queue is empty, return.
+                let message: &OutboundMessage = if let Some(ref message) = *current_write {
+                    message
+                } else {
+                    *current_write = write_queue.pop_front();
+                    match current_write.as_ref() {
+                        Some(message) => {
+                            serialize_segment_table(current_segment_table,
+                                                    &*message.get_segments_for_output());
+                            *current_segment = (0, 0);
+                            message
+                        },
+                        None => return Ok(()),
+                    }
+                };
+
+                let segments = &*message.get_segments_for_output();
+
+                match write_message(inner, current_segment_table, segments, current_segment) {
+                    Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                    Ok(_) => (),
+                    error => return error,
                 }
-            };
-
-            let segments = &*message.get_segments_for_output();
-
-            match write_message(stream, current_segment_table, segments, current_segment) {
-                Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Ok(_) => continue,
-                error => return error,
             }
+            *current_write = None;
         }
     }
 
@@ -284,17 +314,6 @@ impl <S> MessageStream<S> where S: io::Write {
             self.write()
         } else {
             Ok(())
-        }
-    }
-}
-
-impl <S> Iterator for MessageStream<S> where S: io::Read {
-    type Item = Result<Reader<Segments>>;
-
-    fn next(&mut self) -> Option<Result<Reader<Segments>>> {
-        match self.read_message() {
-            Err(Error::Io(ref error)) if error.kind() == io::ErrorKind::WouldBlock => None,
-            a => Some(a),
         }
     }
 }
@@ -403,7 +422,7 @@ pub mod test {
             cursor.set_position(0);
 
             let mut message_reader = MessageStream::new(&mut cursor, message::ReaderOptions::new());
-            let message = message_reader.next().unwrap().unwrap();
+            let message = message_reader.read_message().unwrap().unwrap();
             let result_segments = message.into_segments();
 
             TestResult::from_bool(segments.iter().enumerate().all(|(i, segment)| {
@@ -465,7 +484,7 @@ pub mod test {
             let mut message_reader = MessageStream::new(&mut cursor, message::ReaderOptions::new());
 
             for segments in &messages {
-                let message = message_reader.next().unwrap().unwrap();
+                let message = message_reader.read_message().unwrap().unwrap();
                 let result_segments = message.into_segments();
                 for (i, segment) in segments.into_iter().enumerate() {
                     if &segment[..] != result_segments.get_segment(i as u32).unwrap() {
@@ -497,9 +516,9 @@ pub mod test {
             for segments in &messages {
                 let mut message = None;
                 while let None = message {
-                    message = message_reader.next();
+                    message = message_reader.read_message().unwrap();
                 }
-                let result_segments = message.unwrap().unwrap().into_segments();
+                let result_segments = message.unwrap().into_segments();
                 for (i, segment) in segments.into_iter().enumerate() {
                     if &segment[..] != result_segments.get_segment(i as u32).unwrap() {
                         return TestResult::failed();

@@ -1,0 +1,17 @@
+[package]
+name = "crc-server"
+version = "0.1.0"
+authors = ["Dan Burkert <dan@danburkert.com>"]
+description = "Example MIO server using Cap'n Proto non-blocking serialization."
+
+build = "build.rs"
+
+[dependencies]
+capnp = "0.5"
+capnp-nonblock = { path = "../../" }
+crc = "1"
+mio = "0.4"
+log = "0.3"
+
+[build-dependencies]
+capnpc = "0.5"
