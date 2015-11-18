@@ -122,7 +122,7 @@ impl Connection {
         trace!("reregistering connection {:?}", self);
         assert!(self.token != INITIAL);
         let mut event_set = EventSet::all();
-        if !self.stream.has_queued_outbound_messages() {
+        if self.stream.outbound_queue_len() == 0 {
             event_set = event_set - EventSet::writable()
         };
         try!(event_loop.reregister(self.stream.inner(),

@@ -1,4 +1,8 @@
-#![feature(alloc, heap_api, oom, read_exact)]
+//! `capnp_nonblock` provides a helper struct, `MessageStream`, for reading and
+//! writing [Cap'n Proto](https://capnproto.org/) messages to non-blocking
+//! streams.
+
+#![feature(alloc, drain, heap_api, oom, read_exact)]
 
 extern crate alloc;
 extern crate byteorder;
@@ -25,6 +29,7 @@ use capnp::{Error, Result};
 
 use buf::{MutBuf, Buf};
 
+/// A Cap'n Proto message container.
 pub struct Segments {
     segments: Vec<Buf>,
 }
@@ -37,13 +42,13 @@ impl ReaderSegments for Segments {
 
 pub type OutboundMessage = capnp::message::Builder<capnp::message::HeapAllocator>;
 
-/// A message reader wraps an instance of
-/// [`Read`](https://doc.rust-lang.org/stable/std/io/trait.Read.html) and
-/// provides an iterator over the messages. `MessageStream` performs it's own
-/// internal buffering, so the provided `Read` instance need not be buffered.
+/// A `MessageStream` wraps a stream, and provides methods to read and write
+/// Cap'n Proto messages to the stream. `MessageStream` performs its own
+/// internal buffering, so the provided stream need not be buffered.
 ///
-/// The messages must be in the standard uncompressed Cap'n Proto
-/// [stream format](https://capnproto.org/encoding.html#serialization-over-a-stream).
+/// If the underlying stream is non-blocking, `MessageStream` will automatically
+/// pause reading and writing messages, and will resume during the next call to
+/// `read_message` or `write`.
 ///
 /// `MessageStream` attempts to reduce the number of required allocations when
 /// reading messages by allocating memory in large chunks, which it loans out to
@@ -66,24 +71,25 @@ pub struct MessageStream<S> {
 
     /// Queue of outbound messages which have not yet begun being written to the
     /// stream.
-    write_queue: VecDeque<OutboundMessage>,
-
-    /// The outbound message currently being written to the stream.
-    current_write: Option<OutboundMessage>,
+    outbound_queue: VecDeque<OutboundMessage>,
 
     /// The serialized segment table of the message currently being written to
     /// the stream.
     current_segment_table: Vec<u8>,
 
-    /// The progress of the current write.
+    /// The progress of the current write. The message currently being written
+    /// is a the front of the outbound queue.
     ///
     /// The first corresponds to the segment currently being written, offset by
     /// 1, or 0 if the segment table is being written. The second corresponds to
     /// the offset within the current segment.
-    current_segment: (usize, usize),
+    write_progress: Option<(usize, usize)>,
 }
 
 impl <S> MessageStream<S> {
+
+    /// Creates a new `MessageStream` instance wrapping the provided stream, and
+    /// with the provided reader options.
     pub fn new(inner: S, options: ReaderOptions) -> MessageStream<S> {
         MessageStream {
             inner: inner,
@@ -92,21 +98,33 @@ impl <S> MessageStream<S> {
             buf_offset: 0,
             remaining_segments: Vec::new(),
             segments: Vec::new(),
-            write_queue: VecDeque::new(),
+            outbound_queue: VecDeque::new(),
             current_segment_table: Vec::new(),
-            current_write: None,
-            current_segment: (0, 0),
+            write_progress: None,
         }
     }
 
-    pub fn has_queued_outbound_messages(&self) -> bool {
-        self.current_write.is_some() || !self.write_queue.is_empty()
+    /// Returns the number of outbound queued messages.
+    pub fn outbound_queue_len(&self) -> usize {
+        self.outbound_queue.len()
     }
 
+    /// Clears the outbound message queue of all messages that have not begun
+    /// writing yet.
+    pub fn clear_outbound_queue(&mut self) {
+        if self.write_progress.is_some() {
+            self.outbound_queue.drain(1..);
+        } else {
+            self.outbound_queue.clear();
+        }
+    }
+
+    /// Returns the inner stream.
     pub fn inner_mut(&mut self) -> &mut S {
         &mut self.inner
     }
 
+    /// Returns the inner stream.
     pub fn inner(&self) -> &S {
         &self.inner
     }
@@ -151,6 +169,7 @@ impl <S> MessageStream<S> where S: io::Read {
         Ok(())
     }
 
+    /// Reads a message segment from the stream.
     fn read_segment(&mut self, len: usize) -> Result<Buf> {
         let MessageStream {
             ref mut inner,
@@ -164,6 +183,7 @@ impl <S> MessageStream<S> where S: io::Read {
         Ok(buf)
     }
 
+    /// Reads a message from the stream.
     fn read(&mut self) -> Result<Reader<Segments>> {
         if self.remaining_segments.is_empty() {
             try!(self.read_segment_table());
@@ -181,6 +201,11 @@ impl <S> MessageStream<S> where S: io::Read {
                        self.options.clone()))
     }
 
+    /// Returns the next message from the stream, or `None` if the entire
+    /// message is not yet available.
+    ///
+    /// If an `Err` result is returned, then the stream must be considered
+    /// corrupt, and `read_message` must not be called again.
     pub fn read_message(&mut self) -> Result<Option<Reader<Segments>>> {
         match self.read() {
             Err(Error::Io(ref error)) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
@@ -192,8 +217,8 @@ impl <S> MessageStream<S> where S: io::Read {
 
 impl <S> fmt::Debug for MessageStream<S> where S: fmt::Debug {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "MessageStream {{ inner: {:?}, current_write: {}, outbound_queue_len: {} }}",
-                  self.inner, self.current_write.is_some(), self.write_queue.len())
+        write!(f, "MessageStream {{ inner: {:?}, outbound_queue_len: {} }}",
+               self.inner, self.outbound_queue_len())
     }
 }
 
@@ -235,10 +260,10 @@ where W: io::Write {
 fn write_message<W>(write: &mut W,
                     segment_table: &[u8],
                     segments: &[&[Word]],
-                    current_segment: &mut (usize, usize))
+                    write_progress: &mut (usize, usize))
                     -> io::Result<()>
 where W: io::Write {
-    let (ref mut segment_index, ref mut segment_offset) = *current_segment;
+    let (ref mut segment_index, ref mut segment_offset) = *write_progress;
 
     if *segment_index == 0 {
         try!(write_segment(write, &segment_table[*segment_offset..], segment_offset));
@@ -260,44 +285,43 @@ impl <S> MessageStream<S> where S: io::Write {
 
     /// Writes queued messages to the stream. This should be called when the
     /// stream is in non-blocking mode and writable.
+    ///
+    /// If an `Err` result is returned, then the stream must be considered
+    /// corrupt, and `write` or `write_message` must not be called again.
     pub fn write(&mut self) -> io::Result<()> {
 
         let MessageStream {
             ref mut inner,
-            ref mut write_queue,
-            ref mut current_write,
+            ref mut outbound_queue,
             ref mut current_segment_table,
-            ref mut current_segment,
+            ref mut write_progress,
             ..
         } = *self;
+
         loop {
             {
-                // Get the current message, otherwise pop the next message from the
-                // queue and serialize a new segment table. If the queue is empty, return.
-                let message: &OutboundMessage = if let Some(ref message) = *current_write {
-                    message
-                } else {
-                    *current_write = write_queue.pop_front();
-                    match current_write.as_ref() {
-                        Some(message) => {
-                            serialize_segment_table(current_segment_table,
-                                                    &*message.get_segments_for_output());
-                            *current_segment = (0, 0);
-                            message
-                        },
-                        None => return Ok(()),
-                    }
+                let message: &OutboundMessage = match outbound_queue.front() {
+                    Some(message) => message,
+                    None => return Ok(()),
                 };
 
+                *write_progress = write_progress.or_else(|| {
+                    serialize_segment_table(current_segment_table,
+                                            &*message.get_segments_for_output());
+                    Some((0, 0))
+                });
+
+                let progress: &mut (usize, usize) = write_progress.as_mut().unwrap();
                 let segments = &*message.get_segments_for_output();
 
-                match write_message(inner, current_segment_table, segments, current_segment) {
+                match write_message(inner, current_segment_table, segments, progress) {
                     Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                     Ok(_) => (),
                     error => return error,
                 }
             }
-            *current_write = None;
+            outbound_queue.pop_front();
+            *write_progress = None;
         }
     }
 
@@ -307,10 +331,13 @@ impl <S> MessageStream<S> where S: io::Write {
     /// message currently being written. This is necessary for the blocking
     /// stream case, and efficient in the non-blocking case as well, since it is
     /// likely that the stream is writable.
+    ///
+    /// If an `Err` result is returned, then the stream must be considered
+    /// corrupt, and `write` or `write_message` must not be called again.
     pub fn write_message(&mut self, message: OutboundMessage) -> io::Result<()> {
-        self.write_queue.push_back(message);
+        self.outbound_queue.push_back(message);
 
-        if self.current_write.is_none() {
+        if self.outbound_queue_len() == 1 {
             self.write()
         } else {
             Ok(())
@@ -442,10 +469,10 @@ pub mod test {
                                             .collect::<Vec<_>>()[..];
         let mut segment_table = Vec::new();
         serialize_segment_table(&mut segment_table, segments);
-        let mut current_segment = (0, 0);
+        let mut write_progress = (0, 0);
 
         loop {
-            match write_message(write, &segment_table, segments, &mut current_segment) {
+            match write_message(write, &segment_table, segments, &mut write_progress) {
                 Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => continue,
                 other => { other.unwrap(); return },
             }
