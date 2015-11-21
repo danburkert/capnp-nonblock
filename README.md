@@ -9,20 +9,8 @@ that works with non-blocking streams.
 
 ## Example
 
-An example of using Cap'n Proto messages with a simple
-[MIO](https://github.com/carllerche/mio) server is provided. The server receives
-messages containing data from clients, computes a checksum of the data, and
-returns the checksum to the client.
-
-```bash
-
-# Start the example server
-$ cargo run --example crc -- server
-
-# In a different terminal, send data to the server to be checksummed
-$ printf "foo bar baz" | cargo run --example crc — checksum
-> 0x5F5DCE54
-```
+An [example](examples/crc-server) of using Cap'n Proto messages with a simple
+[MIO](https://github.com/carllerche/mio) server is provided.
 
 ## License
 

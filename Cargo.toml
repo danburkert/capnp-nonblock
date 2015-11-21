@@ -15,7 +15,4 @@ byteorder = "0.4"
 [dev-dependencies]
 capnp = { version = "0.5", features = ["quickcheck"] }
 crc-server = { path = "examples/crc-server" }
-docopt = "0.6"
-env_logger = "0.3"
 quickcheck = "0.2"
-rustc-serialize = "0.3"

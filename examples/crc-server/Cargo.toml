@@ -3,6 +3,7 @@ name = "crc-server"
 version = "0.1.0"
 authors = ["Dan Burkert <dan@danburkert.com>"]
 description = "Example MIO server using Cap'n Proto non-blocking serialization."
+license = "CC0"
 
 build = "build.rs"
 
@@ -10,8 +11,11 @@ build = "build.rs"
 capnp = "0.5"
 capnp-nonblock = { path = "../../" }
 crc = "1"
-mio = "0.4"
+docopt = "0.6"
+env_logger = "0.3"
 log = "0.3"
+mio = "0.4"
+rustc-serialize = "0.3"
 
 [build-dependencies]
 capnpc = "0.5"
