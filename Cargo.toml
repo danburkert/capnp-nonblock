@@ -14,5 +14,4 @@ byteorder = "0.4"
 
 [dev-dependencies]
 capnp = { version = "0.5", features = ["quickcheck"] }
-crc-server = { path = "examples/crc-server" }
 quickcheck = "0.2"
