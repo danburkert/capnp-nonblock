@@ -16,15 +16,24 @@ mod buf;
 #[cfg(test)]
 mod test_utils;
 
+use std::borrow::Borrow;
 use std::collections::VecDeque;
 use std::fmt;
 use std::io;
+use std::marker;
 use std::mem;
 use std::result;
 
 use byteorder::{ByteOrder, LittleEndian};
 use capnp::Word;
-use capnp::message::{Builder, Reader, ReaderOptions, ReaderSegments};
+use capnp::message::{
+    Allocator,
+    Builder,
+    HeapAllocator,
+    Reader,
+    ReaderOptions,
+    ReaderSegments,
+};
 use capnp::{Error, Result};
 
 use buf::{MutBuf, Buf};
@@ -40,8 +49,6 @@ impl ReaderSegments for Segments {
     }
 }
 
-pub type OutboundMessage = capnp::message::Builder<capnp::message::HeapAllocator>;
-
 /// A `MessageStream` wraps a stream, and provides methods to read and write
 /// Cap'n Proto messages to the stream. `MessageStream` performs its own
 /// internal buffering, so the provided stream need not be buffered.
@@ -55,7 +62,7 @@ pub type OutboundMessage = capnp::message::Builder<capnp::message::HeapAllocator
 /// messages via reference counting. The reference counting is not thread safe,
 /// so messages read by `MessageStream` may not be sent or shared across thread
 /// boundaries.
-pub struct MessageStream<S> {
+pub struct MessageStream<S, A=HeapAllocator, M=Builder<A>> {
     inner: S,
     options: ReaderOptions,
 
@@ -71,7 +78,7 @@ pub struct MessageStream<S> {
 
     /// Queue of outbound messages which have not yet begun being written to the
     /// stream.
-    outbound_queue: VecDeque<OutboundMessage>,
+    outbound_queue: VecDeque<M>,
 
     /// The serialized segment table of the message currently being written to
     /// the stream.
@@ -84,13 +91,15 @@ pub struct MessageStream<S> {
     /// 1, or 0 if the segment table is being written. The second corresponds to
     /// the offset within the current segment.
     write_progress: Option<(usize, usize)>,
+
+    marker_: marker::PhantomData<A>,
 }
 
-impl <S> MessageStream<S> {
+impl <S, M, A> MessageStream<S, M, A> {
 
     /// Creates a new `MessageStream` instance wrapping the provided stream, and
     /// with the provided reader options.
-    pub fn new(inner: S, options: ReaderOptions) -> MessageStream<S> {
+    pub fn new(inner: S, options: ReaderOptions) -> MessageStream<S, M, A> {
         MessageStream {
             inner: inner,
             options: options,
@@ -101,10 +110,11 @@ impl <S> MessageStream<S> {
             outbound_queue: VecDeque::new(),
             current_segment_table: Vec::new(),
             write_progress: None,
+            marker_: marker::PhantomData,
         }
     }
 
-    /// Returns the number of outbound queued messages.
+    /// Returns the number of queued outbound messages.
     pub fn outbound_queue_len(&self) -> usize {
         self.outbound_queue.len()
     }
@@ -130,7 +140,7 @@ impl <S> MessageStream<S> {
     }
 }
 
-impl <S> MessageStream<S> where S: io::Read {
+impl <S, M, A> MessageStream<S, M, A> where S: io::Read {
 
     /// Reads the segment table, populating the `remaining_segments` field of the
     /// reader on success.
@@ -215,9 +225,9 @@ impl <S> MessageStream<S> where S: io::Read {
     }
 }
 
-impl <S> fmt::Debug for MessageStream<S> where S: fmt::Debug {
+impl <S, A, M> fmt::Debug for MessageStream<S, A, M> where S: fmt::Debug {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "MessageStream {{ inner: {:?}, outbound_queue_len: {} }}",
+        write!(f, "MessageStream {{ inner: {:?}, outbound_messages: {} }}",
                self.inner, self.outbound_queue_len())
     }
 }
@@ -281,7 +291,7 @@ where W: io::Write {
     Ok(())
 }
 
-impl <S> MessageStream<S> where S: io::Write {
+impl <S, A, M> MessageStream<S, A, M> where S: io::Write, M: Borrow<Builder<A>>, A: Allocator {
 
     /// Writes queued messages to the stream. This should be called when the
     /// stream is in non-blocking mode and writable.
@@ -300,8 +310,8 @@ impl <S> MessageStream<S> where S: io::Write {
 
         loop {
             {
-                let message: &OutboundMessage = match outbound_queue.front() {
-                    Some(message) => message,
+                let message: &Builder<A> = match outbound_queue.front() {
+                    Some(message) => message.borrow(),
                     None => return Ok(()),
                 };
 
@@ -334,7 +344,7 @@ impl <S> MessageStream<S> where S: io::Write {
     ///
     /// If an `Err` result is returned, then the stream must be considered
     /// corrupt, and `write` or `write_message` must not be called again.
-    pub fn write_message(&mut self, message: OutboundMessage) -> io::Result<()> {
+    pub fn write_message(&mut self, message: M) -> io::Result<()> {
         self.outbound_queue.push_back(message);
 
         if self.outbound_queue_len() == 1 {
@@ -448,7 +458,8 @@ pub mod test {
             test_utils::write_message_segments(&mut cursor, &segments);
             cursor.set_position(0);
 
-            let mut message_reader = MessageStream::new(&mut cursor, message::ReaderOptions::new());
+            let mut message_reader =
+                MessageStream::<_, (), ()>::new(&mut cursor, message::ReaderOptions::new());
             let message = message_reader.read_message().unwrap().unwrap();
             let result_segments = message.into_segments();
 
@@ -461,7 +472,7 @@ pub mod test {
     }
 
     /// Equivalent to `MessageStream::write`, but works on raw segments instead
-    /// of `OutboundMessage` objects, and automatically retries on `WouldBlock`.
+    /// of message objects, and automatically retries on `WouldBlock`.
     fn write_message_segments<W>(write: &mut W, segments: &Vec<Vec<Word>>)
     where W: Write {
         let segments: &[&[Word]] = &segments.iter()
@@ -508,7 +519,8 @@ pub mod test {
             }
             cursor.set_position(0);
 
-            let mut message_reader = MessageStream::new(&mut cursor, message::ReaderOptions::new());
+            let mut message_reader =
+                MessageStream::<_, (), ()>::new(&mut cursor, message::ReaderOptions::new());
 
             for segments in &messages {
                 let message = message_reader.read_message().unwrap().unwrap();
@@ -538,7 +550,8 @@ pub mod test {
             }
             stream.inner_mut().set_position(0);
 
-            let mut message_reader = MessageStream::new(&mut stream, message::ReaderOptions::new());
+            let mut message_reader =
+                MessageStream::<_, (), ()>::new(&mut stream, message::ReaderOptions::new());
 
             for segments in &messages {
                 let mut message = None;

@@ -1,11 +1,10 @@
 # crc-server
 
 An example application using `capnp-nonblock` and `mio`. Consists of a server
-which acceps Cap'n Proto messages containing data, and returning the CRC-32
+which accepts Cap'n Proto messages containing data, and returns the CRC-32
 checksum of the data.
 
 ```bash
-
 # Start the example server
 $ cargo run server
 
@@ -18,6 +17,6 @@ $ printf "foo bar baz" | cargo run --example crc — checksum
 
 `crc-server` is distributed under the Creative Commons Zero license, as well as
 the licenses of `capnp-nonblock` (MIT and Apache). The intent of licensing under
-CC0 is to waive the requirement of attribution when copying the example.
+CC0 is to waive the attribution requirement of MIT and Apache.
 
 See [LICENSE-CC0](LICENSE-CC0) for details.
