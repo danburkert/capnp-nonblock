@@ -2,7 +2,7 @@
 //! writing [Cap'n Proto](https://capnproto.org/) messages to non-blocking
 //! streams.
 
-#![feature(alloc, drain, heap_api, oom, read_exact)]
+#![feature(alloc, heap_api, oom)]
 
 extern crate alloc;
 extern crate byteorder;
