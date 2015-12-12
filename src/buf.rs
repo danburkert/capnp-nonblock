@@ -70,7 +70,7 @@ impl MutBuf {
             let target_offset = self.offset + amount;
             while self.offset < target_offset {
                 match try!(read.read(&mut buf)) {
-                    0 => return Result::Err(io::Error::new(io::ErrorKind::UnexpectedEOF,
+                    0 => return Result::Err(io::Error::new(io::ErrorKind::UnexpectedEof,
                                                            "failed to fill whole buffer")),
                     n => {
                         self.offset += n;
