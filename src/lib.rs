@@ -348,7 +348,13 @@ impl <S, A, M> MessageStream<S, A, M> where S: io::Write, M: Borrow<Builder<A>>,
         self.outbound_queue.push_back(message);
 
         if self.outbound_queue_len() == 1 {
-            self.write()
+            // Swallow NotConnected error when aggressively writing. OS X will
+            // return NotConnected when writing to a freshly opened non-blocking
+            // socket; see hoverbear/raft#61.
+            match self.write() {
+                Err(ref error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
+                other => other,
+            }
         } else {
             Ok(())
         }
