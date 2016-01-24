@@ -19,7 +19,7 @@ mod test_utils;
 use std::borrow::Borrow;
 use std::collections::VecDeque;
 use std::fmt;
-use std::io;
+use std::io::{self, Error, ErrorKind, Result};
 use std::marker;
 use std::mem;
 use std::result;
@@ -34,7 +34,6 @@ use capnp::message::{
     ReaderOptions,
     ReaderSegments,
 };
-use capnp::{Error, Result};
 
 use buf::{MutBuf, Buf};
 
@@ -144,7 +143,7 @@ impl <S, M, A> MessageStream<S, M, A> where S: io::Read {
 
     /// Reads the segment table, populating the `remaining_segments` field of the
     /// reader on success.
-    fn read_segment_table(&mut self) -> Result<()> {
+    fn read_segment_table(&mut self) -> io::Result<()> {
         let MessageStream {
             ref mut inner,
             ref options,
@@ -159,7 +158,7 @@ impl <S, M, A> MessageStream<S, M, A> where S: io::Read {
             match parse_segment_table(&buf[*buf_offset..], remaining_segments) {
                 Ok(0) => break,
                 Ok(n) => try!(buf.fill_or_replace(inner, buf_offset, n)),
-                Err(error) => return result::Result::Err(error),
+                Err(error) => return Err(error),
             }
         }
 
@@ -171,8 +170,8 @@ impl <S, M, A> MessageStream<S, M, A> where S: io::Read {
                                           });
         match total_len {
             Some(len) if len <= options.traversal_limit_in_words * 8 => (),
-            other => return result::Result::Err(Error::new_decode_error(
-                    "message is too large", Some(format!("{:?}", other.map(|n| n / 8))))),
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidData,
+                                           "Cap'n Proto message is too large".to_string())),
         }
 
         remaining_segments.reverse();
@@ -194,7 +193,7 @@ impl <S, M, A> MessageStream<S, M, A> where S: io::Read {
     }
 
     /// Reads a message from the stream.
-    fn read(&mut self) -> Result<Reader<Segments>> {
+    fn read(&mut self) -> io::Result<Reader<Segments>> {
         if self.remaining_segments.is_empty() {
             try!(self.read_segment_table());
         }
@@ -218,8 +217,8 @@ impl <S, M, A> MessageStream<S, M, A> where S: io::Read {
     /// corrupt, and `read_message` must not be called again.
     pub fn read_message(&mut self) -> Result<Option<Reader<Segments>>> {
         match self.read() {
-            Err(Error::Io(ref error)) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
-            Err(error) => Err(error),
+            Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(From::from(error)),
             Ok(message) => Ok(Some(message)),
         }
     }
@@ -372,10 +371,12 @@ fn parse_segment_table(buf: &[u8], lengths: &mut Vec<usize>) -> Result<usize> {
                                                     .wrapping_add(1) as usize;
 
     if segment_count >= 512 {
-        return result::Result::Err(Error::new_decode_error("too many segments in message",
-                                                           Some(format!("{}", segment_count))));
+        return result::Result::Err(Error::new(ErrorKind::InvalidData,
+                                              format!("too many segments in Cap'n Proto message: {}",
+                                                      segment_count)));
     } else if segment_count == 0 {
-        return result::Result::Err(Error::new_decode_error("zero segments in message", None));
+        return result::Result::Err(Error::new(ErrorKind::InvalidData,
+                                              "zero segments Cap'n Proto message".to_string()));
     }
 
     let len = (segment_count / 2 + 1) * 8;

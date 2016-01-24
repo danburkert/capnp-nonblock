@@ -9,9 +9,9 @@ description = "A Cap'n Proto message serializer and deserializer that works with
 keywords = ["capnproto", "mio", "async", "non-blocking"]
 
 [dependencies]
-capnp = "0.5"
+capnp = "0.6"
 byteorder = "0.4"
 
 [dev-dependencies]
-capnp = { version = "0.5", features = ["quickcheck"] }
+capnp = { version = "0.6", features = ["quickcheck"] }
 quickcheck = "0.2"
