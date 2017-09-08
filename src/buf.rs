@@ -74,7 +74,7 @@ impl MutBuf {
                                                            "failed to fill whole buffer")),
                     n => {
                         self.offset += n;
-                        let mut tmp = buf;
+                        let tmp = buf;
                         buf = &mut tmp[n..];
                     },
                 }
