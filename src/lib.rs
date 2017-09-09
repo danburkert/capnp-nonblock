@@ -3,7 +3,7 @@
 //! streams.
 
 #![feature(alloc, allocator_api)]
-#![doc(html_root_url = "https://docs.rs/capnp-nonblock/0.3.0")]
+#![doc(html_root_url = "https://docs.rs/capnp-nonblock/0.4.0")]
 
 extern crate alloc;
 extern crate byteorder;
