@@ -7,10 +7,8 @@ env:
   global:
     - CC=gcc-4.8
     - CXX=g++-4.8
-    - TRAVIS_CARGO_NIGHTLY_FEATURE=""
-    - secure: "i4EAC5Wh6ig0twXkslK7DdDCVLYXUlisLJtxN2ALe8vljBu75Yq68EVKioeOB+7nNiy831mvqHca7b6ipogRUNAKBjrzPnz93ih5sRCurEJnSIsqeRrROFJtoc4PntOohQsYs85NBG4Jq/Ext0vCBKePcIWs23jNEo1wPcw8jUXLN+4Zs1j5VnB1IpSgdZfzOCiXviz/0x1w1LdvnGonYg/qIaOGc00awkn2L8JxRztmCIujBA48b/FHytJaNOpoiGERsBIbzLNyW2QUhpDHFajb/sRbY6OLS2Jo+o+n6teO0WqeIUUwTLaaiq50jb7c7jtyB3fx5Ne1IQGw1KOgJp5No5d7EYWpV6Fh+YcN0eosbyU+M9mWf6XjHmdpb+uyzqrf4ekGTJaFiuOWY5hrsCDHLO+IVrh7+DhJpLUuc5WVUDKu3bynaUCw6zsJztdHeHA4RRqfA6fCRBqiB5RvkAOEzZuzOj2MO0F6wwqrB1E4eaTwh147NbPfqx99viN/I9FyLY+MXkNnR1VDTKyM0Mp/QJc0/ralI40PghAFTrUoDNsUxsR+Roc07QVbd0r0SXX/OL9smrB6Sp/qsirnYMLDyMoXIglUL9tx84OC+FsdwTPJTyQxTUepSx08+mbi2jXrOtpyhHYPmCCcvotHKwWleNPe8WCjg9KfRGwf93Q="
 
-# We need to install Cap'n Proto.
+# install Cap'n Proto.
 install:
     - git clone https://github.com/kentonv/capnproto.git
     - cd capnproto/c++
@@ -32,12 +30,6 @@ addons:
       - gcc-4.8
       - g++-4.8
 
-before_script:
-  - pip install 'travis-cargo<0.2' --user && export PATH=$HOME/.local/bin:$PATH
-
 script:
-  - travis-cargo build && travis-cargo test && travis-cargo --only nightly doc
-
-after_success:
-  - travis-cargo --only nightly doc-upload --branch master
-
+  - cargo build -v
+  - env RUST_BACKTRACE=1 cargo test -v;

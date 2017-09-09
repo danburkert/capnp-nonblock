@@ -3,7 +3,7 @@
 A Rust [Cap'n Proto](https://capnproto.org/) message serializer and deserializer
 that works with non-blocking streams.
 
-[Documentation](https://danburkert.github.io/capnp-nonblock/capnp_nonblock/index.html)
+[Documentation](https://docs.rs/capnp-nonblock)
 
 [![Status](https://travis-ci.org/danburkert/capnp-nonblock.svg?branch=master)](https://travis-ci.org/danburkert/capnp-nonblock)
 
