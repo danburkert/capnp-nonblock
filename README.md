@@ -7,6 +7,14 @@ that works with non-blocking streams.
 
 [![Status](https://travis-ci.org/danburkert/capnp-nonblock.svg?branch=master)](https://travis-ci.org/danburkert/capnp-nonblock)
 
+## Deprecated
+
+This crate is effectively retired; it hails from a time before
+[futures](https://crates.io/crates/futures), [Tokio](https://tokio.rs/) and
+[capnp-futures](https://crates.io/crates/capnp-futures). Existing projects
+utilizing this crate are encouraged to move to `capnp-futures`. Bug-fix pull
+requests are accepted, but no new features will be released.
+
 ## Example
 
 An [example](examples/crc-server) of using Cap'n Proto messages with a simple

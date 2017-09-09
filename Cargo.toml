@@ -5,7 +5,7 @@ authors = ["Dan Burkert <dan@danburkert.com>"]
 license = "MIT/Apache-2.0"
 repository = "https://github.com/danburkert/capnp-nonblock"
 documentation = "https://danburkert.github.io/capnp-nonblock/capnp_nonblock/index.html"
-description = "A Cap'n Proto message serializer and deserializer that works with non-blocking streams."
+description = "[deprecated] A Cap'n Proto message serializer and deserializer that works with non-blocking streams."
 keywords = ["capnproto", "mio", "async", "non-blocking"]
 
 [dependencies]
